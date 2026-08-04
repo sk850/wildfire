@@ -18,28 +18,24 @@ import os
 import time
 from datetime import date
 from pathlib import Path
-from dotenv import load_dotenv
 
 import pandas as pd
 import requests
 
-load_dotenv()
+from landcover_filter import filter_fire_detections
 
-FIRMS_MAP_KEY = os.getenv('FIRMS_MAP_KEY')
+FIRMS_MAP_KEY = os.environ.get("FIRMS_MAP_KEY")
 FIRMS_BASE_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
 
-
-# Sensor choice matters:
 #   VIIRS_NOAA20_NRT / VIIRS_SNPP_NRT -> higher spatial resolution, good default
 #   MODIS_NRT                          -> longer historical record, coarser
 SENSOR = "VIIRS_NOAA20_NRT"
 
 # west,south,east,north — this example box roughly covers California.
-# Swap in your target region.
+
 BOUNDING_BOX = "-124,32,-114,42"
 
 # How many days back to pull (max useful range depends on transaction cost —
-# see rate limit note below)
 DAY_RANGE = 3
 
 OUTPUT_DIR = Path("data/raw/firms")
@@ -93,21 +89,8 @@ def save_snapshot(df: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> Path:
 
 
 def send_to_kafka(df: pd.DataFrame, topic: str = "firms-raw") -> None:
-    """Stub for the v2 streaming upgrade — swap in kafka-python or
-    confluent-kafka once you're past the local-CSV milestone.
 
-        from kafka import KafkaProducer
-        import json
-
-        producer = KafkaProducer(
-            bootstrap_servers="localhost:9092",
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        )
-        for _, row in df.iterrows():
-            producer.send(topic, row.to_dict())
-        producer.flush()
-    """
-    raise NotImplementedError("Wire this up once Kafka is running — see docstring.")
+    raise NotImplementedError("")
 
 
 if __name__ == "__main__":
@@ -124,6 +107,15 @@ if __name__ == "__main__":
         print("No fire detections in this window — that's a valid result, "
               "not necessarily a bug.")
     else:
-        out_path = save_snapshot(df)
-        print(f"Saved to {out_path}")
-        print(df[["latitude", "longitude", "acq_date", "confidence"]].head())
+        # Filter out likely agricultural/industrial thermal anomalies before
+        # this data ever reaches Kafka or the fire_events table — see
+        # landcover_filter.py for why FIRMS alone can't distinguish these.
+        df = filter_fire_detections(df)
+
+        if df.empty:
+            print("All detections filtered out as non-wildfire (agriculture/"
+                  "low-confidence/low-intensity) — nothing to save.")
+        else:
+            out_path = save_snapshot(df)
+            print(f"Saved to {out_path}")
+            print(df[["latitude", "longitude", "acq_date", "confidence"]].head())
