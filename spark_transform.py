@@ -40,18 +40,11 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 WEATHER_TABLE = "weather_features"
 FIRE_TABLE = "fire_events"
 
-# Checkpointing is what makes Structured Streaming fault-tolerant — if this
-# job restarts, it resumes from here instead of reprocessing or dropping
-# data. Point this at durable storage (not /tmp) once this is more than a
-# local experiment. Each stream needs its OWN checkpoint dir.
+
 CHECKPOINT_BASE = os.environ.get("CHECKPOINT_BASE", "/tmp/spark-checkpoints")
 WEATHER_CHECKPOINT_DIR = f"{CHECKPOINT_BASE}/weather-features"
 FIRE_CHECKPOINT_DIR = f"{CHECKPOINT_BASE}/fire-events"
 
-# --- Schemas -----------------------------------------------------------
-# Kafka messages arrive as raw bytes; Spark needs an explicit schema to
-# parse the JSON payload. These mirror the fields the ingestion scripts
-# actually produce — adjust if you change the fetcher output.
 
 WEATHER_SCHEMA = StructType([
     StructField("latitude", DoubleType()),
@@ -102,9 +95,7 @@ def parse_json_stream(raw_df, schema):
 
 def parse_windspeed_mph(windspeed_str_col):
     """NWS returns windSpeed as a free-text string ('10 mph', '5 to 10 mph').
-    Extract the first number as a rough numeric feature. Good enough for a
-    v1 model — revisit if wind-gust ranges turn out to matter more than
-    this simplification captures."""
+    Extract the first number as a rough numeric feature."""
     return regexp_extract(windspeed_str_col, r"(\d+)", 1).cast(DoubleType())
 
 
