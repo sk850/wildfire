@@ -11,6 +11,11 @@ progressively stronger filters:
     3. Land cover   (requires an external lookup — this is the one that
                      actually targets your "exclude agriculture" question)
 
+Land cover uses the USGS National Land Cover Database (NLCD), queried via
+its public ArcGIS ImageServer "identify" endpoint — a point-in-time REST
+lookup, no bulk raster download needed. NLCD only covers the US (+ PR/USVI);
+if your target region is outside the US, you'd swap in a global product
+like ESA WorldCover instead (same filtering logic, different source).
 
 NLCD land cover codes relevant to this filter:
     81 = Pasture/Hay
@@ -27,7 +32,11 @@ from functools import lru_cache
 import pandas as pd
 import requests
 
-
+# USGS-hosted NLCD land cover MapServer (100m resolution). This is a public,
+# no-auth-required identify endpoint. Point/param format follows the
+# standard ArcGIS REST "identify" operation; verify against
+# https://www.mrlc.gov/ or the service's own /identify docs if this ever
+# 404s, since GIS service URLs do occasionally get reorganized.
 NLCD_IDENTIFY_URL = "https://smallscale.nationalmap.gov/arcgis/rest/services/LandCover/MapServer/identify"
 
 AGRICULTURAL_NLCD_CODES = {81, 82}  # Pasture/Hay, Cultivated Crops
@@ -35,10 +44,14 @@ AGRICULTURAL_NLCD_CODES = {81, 82}  # Pasture/Hay, Cultivated Crops
 # Confidence values differ by sensor:
 #   VIIRS: "l" (low), "n" (nominal), "h" (high)
 #   MODIS: 0-100 integer
-MIN_MODIS_CONFIDENCE = 60         
-DROP_VIIRS_LOW_CONFIDENCE = True   
+MIN_MODIS_CONFIDENCE = 60          # drop below this for MODIS rows
+DROP_VIIRS_LOW_CONFIDENCE = True   # drop rows where confidence == "l"
 
-
+# FRP threshold in megawatts — small agricultural/industrial heat sources
+# typically sit low; large wildfires spike much higher. This number is a
+# starting point, not a validated constant — calibrate it against your
+# target region's actual FRP distribution before trusting it (see
+# `inspect_frp_distribution` below).
 MIN_FRP_MW = 5.0
 
 
@@ -90,10 +103,12 @@ def _get_nlcd_code(latitude: float, longitude: float) -> int | None:
     FIRMS detections often cluster spatially (same fire, many pixels) —
     no need to re-query the same rounded coordinate repeatedly.
 
-    Returns the NLCD class code, or None if the lookup fails (e.g. point
-    falls outside CONUS coverage, or the service is unreachable) — treat
-    None as "unknown", not "safe to include", when deciding what to do
-    with it.
+    Returns the NLCD class code. Raises on failure rather than returning
+    None — a filter whose entire job is to exclude false positives must
+    not silently degrade to "let everything through" when a lookup fails.
+    Callers decide how to handle failures explicitly (see
+    filter_by_landcover's on_lookup_failure parameter), instead of that
+    decision being made implicitly here.
     """
     params = {
         "geometry": f"{longitude},{latitude}",
@@ -104,22 +119,32 @@ def _get_nlcd_code(latitude: float, longitude: float) -> int | None:
         "f": "json",
     }
 
-    try:
-        resp = requests.get(NLCD_IDENTIFY_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        if not results:
-            return None
-        # "value" typically holds the raw class code as a string
-        raw_value = results[0].get("value")
-        return int(raw_value) if raw_value is not None else None
-    except (requests.RequestException, ValueError, KeyError):
-        return None
+    resp = requests.get(NLCD_IDENTIFY_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        return None  # legitimate "outside coverage area" result, not a failure
+    raw_value = results[0].get("value")
+    return int(raw_value) if raw_value is not None else None
 
 
-def filter_by_landcover(df: pd.DataFrame, request_delay: float = 0.1) -> pd.DataFrame:
+def filter_by_landcover(df: pd.DataFrame, request_delay: float = 0.1,
+                         on_lookup_failure: str = "raise") -> pd.DataFrame:
     """Drop detections that fall on agricultural land (NLCD codes 81/82).
+
+    on_lookup_failure controls what happens when the NLCD service is
+    unreachable or errors out:
+        "raise" (default) - stop immediately; you should know your filter
+                             isn't working rather than silently pass
+                             unfiltered data downstream
+        "keep_unfiltered"  - let failed-lookup rows through as-is, but
+                             print a loud warning with a count, so it's
+                             visible in logs rather than invisible
+        "drop"             - treat lookup failures as agricultural (safer
+                             for precision, at the cost of losing some
+                             legitimate wildfire detections you couldn't
+                             classify)
 
     This does one NLCD lookup per row, which is slow for large batches —
     fine for a v1 project processing a few hundred detections at a time,
@@ -127,38 +152,71 @@ def filter_by_landcover(df: pd.DataFrame, request_delay: float = 0.1) -> pd.Data
     a downloaded NLCD GeoTIFF clipped to your region) instead of one HTTP
     call per point.
 
-    request_delay adds a small pause between uncached lookups to be a
-    polite API citizen — this is a shared public USGS service, not a
-    dedicated endpoint for your project.
+    NOTE: this service currently serves NLCD 2001 land cover — over two
+    decades old. Land use has changed since then; treat this as a rough
+    filter, not ground truth, and consider a more recent land cover
+    source (e.g. MRLC's newer NLCD releases, or ESA WorldCover) if
+    precision here matters a lot to your results.
     """
     if df.empty:
         return df
 
+    if on_lookup_failure not in {"raise", "keep_unfiltered", "drop"}:
+        raise ValueError(f"Invalid on_lookup_failure: {on_lookup_failure}")
+
     keep_mask = []
+    failures = 0
+
     for _, row in df.iterrows():
         lat = round(float(row["latitude"]), 4)
         lon = round(float(row["longitude"]), 4)
 
         misses_before = _get_nlcd_code.cache_info().misses
-        nlcd_code = _get_nlcd_code(lat, lon)
-        was_cache_miss = _get_nlcd_code.cache_info().misses > misses_before
 
+        try:
+            nlcd_code = _get_nlcd_code(lat, lon)
+        except (requests.RequestException, ValueError, KeyError) as e:
+            failures += 1
+            if on_lookup_failure == "raise":
+                raise RuntimeError(
+                    f"Land cover lookup failed for ({lat}, {lon}): {e}. "
+                    f"Set on_lookup_failure='keep_unfiltered' or 'drop' to "
+                    f"tolerate this, but understand the tradeoff first — "
+                    f"see filter_by_landcover's docstring."
+                ) from e
+            elif on_lookup_failure == "keep_unfiltered":
+                keep_mask.append(True)
+                continue
+            else:  # "drop"
+                keep_mask.append(False)
+                continue
+
+        was_cache_miss = _get_nlcd_code.cache_info().misses > misses_before
         if was_cache_miss:
             time.sleep(request_delay)
 
-        # Unknown land cover: keep the detection rather than silently
-        # dropping it — you want a human to notice unresolved points, not
-        # have them vanish. Flag separately if you want to audit these.
         is_agricultural = nlcd_code in AGRICULTURAL_NLCD_CODES
         keep_mask.append(not is_agricultural)
+
+    if failures > 0 and on_lookup_failure == "keep_unfiltered":
+        print(f"  WARNING: {failures} land cover lookups failed and were "
+              f"passed through UNFILTERED — these rows were not checked "
+              f"for agricultural land.")
 
     return df[keep_mask].copy()
 
 
-def filter_fire_detections(df: pd.DataFrame, apply_landcover: bool = True) -> pd.DataFrame:
+def filter_fire_detections(df: pd.DataFrame, apply_landcover: bool = True,
+                            on_lookup_failure: str = "raise") -> pd.DataFrame:
     """Full pipeline: confidence -> FRP -> land cover. Each stage is cheap
     to expensive, so cheaper filters run first to shrink the dataset
-    before the slower per-point land cover lookups."""
+    before the slower per-point land cover lookups.
+
+    on_lookup_failure is passed through to filter_by_landcover — see its
+    docstring. Default "raise" means a broken/unreachable land cover
+    service stops the pipeline loudly rather than silently shipping
+    unfiltered data.
+    """
     before = len(df)
 
     df = filter_by_confidence(df)
@@ -168,7 +226,7 @@ def filter_fire_detections(df: pd.DataFrame, apply_landcover: bool = True) -> pd
     after_frp = len(df)
 
     if apply_landcover:
-        df = filter_by_landcover(df)
+        df = filter_by_landcover(df, on_lookup_failure=on_lookup_failure)
     after_landcover = len(df)
 
     print(
