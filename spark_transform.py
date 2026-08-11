@@ -1,11 +1,38 @@
 """
-Spark Structured Streaming job: consumes raw weather + fire events from
+Spark Structured Streaming job: consumes LIVE weather + fire events from
 Kafka, engineers risk-relevant features, and writes results to Postgres.
 
-Two independent streaming queries run side by side:
-    - weather-raw -> weather_features table  (PREDICTORS: conditions over time)
-    - firms-raw   -> fire_events table        (LABELS: did a fire actually occur)
+IMPORTANT SCOPE NOTE: this pipeline is for LIVE/PRODUCTION SERVING ONLY,
+not for generating training data.
 
+    weather-raw -> weather_features_live table
+        Sourced from nws_fetcher.py, which hits api.weather.gov — a
+        FORECAST/CURRENT-CONDITIONS API with no historical backfill
+        capability. This table can only ever contain data from whenever
+        you first started running the fetcher, going forward. It is
+        NOT usable to reconstruct "what were conditions on some past
+        date" — there's nothing before your own start date to query.
+
+    firms-raw -> fire_events table
+        LABELS: did fire activity occur. This one legitimately has deep
+        history, since FIRMS serves historical satellite detections on
+        demand.
+
+Because of this asymmetry, do NOT join weather_features_live against
+fire_events to build training data — for any fire in fire_events that
+predates when you started this streaming job, there's no matching
+weather row, so the join would silently return almost nothing (or
+misaligned garbage if you're not careful about it).
+
+Training data instead comes from a separate BATCH pipeline:
+    historical_weather_fetcher.py (Open-Meteo Archive API, true historical
+    observations) -> historical_weather_features table -> joined against
+    fire_events with an explicit day-lag. See schema.sql for that table
+    and the correct join example.
+
+Once a model is trained on that historical batch data, THIS streaming
+job is what feeds it live predictions going forward — that's its actual
+job, and it's a different data flow, not the same one instantiated twice.
 
 Run with (note: you MUST use spark-submit with the Kafka + Postgres
 connector packages, not `python spark_transform.py` directly):
@@ -37,14 +64,23 @@ POSTGRES_URL = os.environ.get("POSTGRES_URL", "jdbc:postgresql://localhost:5432/
 POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 
-WEATHER_TABLE = "weather_features"
+WEATHER_TABLE = "weather_features_live"  # NWS forecasts only — see module
+                                           # docstring; NOT joinable against
+                                           # historical fire_events for training
 FIRE_TABLE = "fire_events"
 
-
+# Checkpointing is what makes Structured Streaming fault-tolerant — if this
+# job restarts, it resumes from here instead of reprocessing or dropping
+# data. Point this at durable storage (not /tmp) once this is more than a
+# local experiment. Each stream needs its OWN checkpoint dir.
 CHECKPOINT_BASE = os.environ.get("CHECKPOINT_BASE", "/tmp/spark-checkpoints")
 WEATHER_CHECKPOINT_DIR = f"{CHECKPOINT_BASE}/weather-features"
 FIRE_CHECKPOINT_DIR = f"{CHECKPOINT_BASE}/fire-events"
 
+# --- Schemas -----------------------------------------------------------
+# Kafka messages arrive as raw bytes; Spark needs an explicit schema to
+# parse the JSON payload. These mirror the fields the ingestion scripts
+# actually produce — adjust if you change the fetcher output.
 
 WEATHER_SCHEMA = StructType([
     StructField("latitude", DoubleType()),
@@ -95,15 +131,19 @@ def parse_json_stream(raw_df, schema):
 
 def parse_windspeed_mph(windspeed_str_col):
     """NWS returns windSpeed as a free-text string ('10 mph', '5 to 10 mph').
-    Extract the first number as a rough numeric feature."""
+    Extract the first number as a rough numeric feature. Good enough for a
+    v1 model — revisit if wind-gust ranges turn out to matter more than
+    this simplification captures."""
     return regexp_extract(windspeed_str_col, r"(\d+)", 1).cast(DoubleType())
 
 
 def engineer_weather_features(parsed_df):
     """Rolling-window aggregates over a 6-hour tumbling window per location.
-    These are the actual model inputs — raw point-in-time readings are
-    noisy, but trends (is humidity dropping, is wind picking up) are what
-    correlate with fire risk."""
+
+    LIVE/PRODUCTION SCOPE ONLY — see module docstring. These are inputs
+    for real-time inference against an already-trained model, sourced
+    from NWS forecasts. They are NOT training data — for that, use
+    historical_weather_fetcher.py's batch output instead."""
     df = parsed_df.withColumn("wind_mph", parse_windspeed_mph(col("windSpeed")))
 
     windowed = (
@@ -132,7 +172,11 @@ def engineer_weather_features(parsed_df):
 def engineer_fire_events(parsed_df):
     """Aggregate fire detection counts per grid cell per day. This is the
     LABEL side of the pipeline — 'did fire activity occur here' — not a
-    predictive feature. """
+    predictive feature. Kept in its own table (fire_events) rather than
+    joined into any weather table directly here. Training-time joins
+    against historical_weather_features (a separate batch pipeline) must
+    be explicit about the time lag between predictor and outcome — see
+    schema.sql."""
     df = parsed_df.withColumn("detected_at", to_timestamp(col("acq_date")))
 
     windowed = (

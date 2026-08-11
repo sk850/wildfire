@@ -182,7 +182,7 @@ if __name__ == "__main__":
         # Filter out likely agricultural/industrial thermal anomalies before
         # this data ever reaches Kafka or the fire_events table — see
         # landcover_filter.py for why FIRMS alone can't distinguish these.
-        df = filter_fire_detections(df)
+        df = filter_fire_detections(df, apply_landcover = False)
 
         if df.empty:
             print("All detections filtered out as non-wildfire (agriculture/"
